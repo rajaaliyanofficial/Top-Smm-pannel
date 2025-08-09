@@ -1,1 +1,272 @@
 # Top-Smm-pannel
+```php
+<?php
+// config.php
+// Edit these values before using
+
+// Database
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'smm_panel');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+
+// Panel settings
+define('SITE_NAME', 'My Free SMM Panel');
+define('ADMIN_PASS', 'admin123'); // change this after install
+
+// Example supplier API settings (replace with real supplier)
+define('SUPPLIER_API_URL', 'https://example-supplier.com/api/v2');
+define('SUPPLIER_API_KEY', 'YOUR_SUPPLIER_API_KEY');
+
+// Basic PDO database connection
+function getPDO(){
+    static $pdo = null;
+    if($pdo) return $pdo;
+    $dsn = 'mysql:host='.DB_HOST.';dbname='.DB_NAME.';charset=utf8mb4';
+    $pdo = new PDO($dsn, DB_USER, DB_PASS, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    ]);
+    return $pdo;
+}
+
+// Simple helper for escaping output
+function e($s){ echo htmlspecialchars($s, ENT_QUOTES); }
+
+?>
+```
+
+---
+
+### FILE: db.sql
+
+```sql
+-- db.sql
+CREATE TABLE IF NOT EXISTS users (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(100) UNIQUE NOT NULL,
+  password VARCHAR(255) NOT NULL,
+  balance DECIMAL(12,2) DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS services (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  code VARCHAR(50) NOT NULL,
+  name VARCHAR(150) NOT NULL,
+  price_per_unit DECIMAL(10,4) NOT NULL DEFAULT 0.00,
+  supplier_service_id VARCHAR(100) DEFAULT NULL
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  service_id INT NOT NULL,
+  link TEXT,
+  quantity INT NOT NULL,
+  price DECIMAL(12,2) NOT NULL,
+  status VARCHAR(50) DEFAULT 'pending',
+  supplier_order_id VARCHAR(255) DEFAULT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
+);
+
+-- Insert a sample service (you can edit later from admin)
+INSERT INTO services (code, name, price_per_unit, supplier_service_id) VALUES
+('fb_likes', 'Facebook Post Likes', 0.10, 'SUP_FB_LIKES_100');
+```
+
+---
+
+### FILE: supplier_api.php
+
+```php
+<?php
+// supplier_api.php
+require_once 'config.php';
+
+// Example function that sends order to supplier API using cURL
+function sendToSupplier($supplierServiceId, $link, $quantity){
+    // NOTE: This is a simplistic example. Replace parameters according to your supplier's API.
+    $post = [
+        'api_key' => SUPPLIER_API_KEY,
+        'action' => 'create',
+        'service' => $supplierServiceId,
+        'link' => $link,
+        'quantity' => $quantity
+    ];
+
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, SUPPLIER_API_URL);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($post));
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+
+    $resp = curl_exec($ch);
+    $err = curl_error($ch);
+    curl_close($ch);
+
+    if($err) return ['success'=>false, 'error'=>$err];
+
+    // Many suppliers return JSON. Adjust parsing as needed.
+    $json = json_decode($resp, true);
+    if(json_last_error() === JSON_ERROR_NONE) return ['success'=>true, 'response'=>$json];
+
+    // fallback: return raw response
+    return ['success'=>true, 'response'=>$resp];
+}
+
+?>
+```
+
+---
+
+### FILE: index.php
+
+```php
+<?php
+require_once 'config.php';
+require_once 'supplier_api.php';
+$pdo = getPDO();
+session_start();
+
+$action = $_GET['action'] ?? 'home';
+
+// Simple auth helpers
+function isLogged(){ return !empty($_SESSION['user_id']); }
+function currentUser($pdo){ if(!isLogged()) return null; return $pdo->query("SELECT * FROM users WHERE id=".(int)$_SESSION['user_id'])->fetch(); }
+
+if($_SERVER['REQUEST_METHOD'] === 'POST'){
+    if(isset($_POST['register'])){
+        $u = trim($_POST['username']);
+        $p = password_hash($_POST['password'], PASSWORD_DEFAULT);
+        $stmt = $pdo->prepare('INSERT INTO users (username,password) VALUES (?,?)');
+        try{ $stmt->execute([$u,$p]); $_SESSION['user_id'] = $pdo->lastInsertId(); header('Location: index.php'); exit; }
+        catch(Exception $e){ $error = 'Username taken or DB error'; }
+    }
+    if(isset($_POST['login'])){
+        $u = trim($_POST['username']);
+        $stmt = $pdo->prepare('SELECT * FROM users WHERE username=?'); $stmt->execute([$u]); $user = $stmt->fetch();
+        if($user && password_verify($_POST['password'],$user['password'])){ $_SESSION['user_id'] = $user['id']; header('Location: index.php'); exit; } else $error='Invalid';
+    }
+    if(isset($_POST['order']) && isLogged()){
+        $svc = (int)$_POST['service_id']; $link = trim($_POST['link']); $qty = (int)$_POST['quantity'];
+        // fetch service price
+        $s = $pdo->prepare('SELECT * FROM services WHERE id=?'); $s->execute([$svc]); $service = $s->fetch();
+        if(!$service) $error='Invalid service';
+        else{
+            $price = $qty * $service['price_per_unit'];
+            // create local order
+            $ins = $pdo->prepare('INSERT INTO orders (user_id,service_id,link,quantity,price,status) VALUES (?,?,?,?,?,?)');
+            $ins->execute([$_SESSION['user_id'],$svc,$link,$qty,$price,'pending']);
+            $orderId = $pdo->lastInsertId();
+
+            // Try to send to supplier
+            if(!empty($service['supplier_service_id'])){
+                $res = sendToSupplier($service['supplier_service_id'],$link,$qty);
+                if($res['success']){
+                    // NOTE: adjust mapping according to supplier response
+                    $supplierOrderId = is_array($res['response']) && isset($res['response']['order']) ? $res['response']['order'] : (is_string($res['response']) ? $res['response'] : null);
+                    $pdo->prepare('UPDATE orders SET status=?, supplier_order_id=? WHERE id=?')->execute(['processing', $supplierOrderId, $orderId]);
+                } else {
+                    // keep pending and show message
+                    $pdo->prepare('UPDATE orders SET status=? WHERE id=?')->execute(['supplier_failed',$orderId]);
+                }
+            }
+            header('Location: index.php?action=orders'); exit;
+        }
+    }
+}
+
+?><!doctype html>
+<html><head><meta charset="utf-8"><title><?php e(SITE_NAME); ?></title></head><body>
+<h1><?php e(SITE_NAME); ?></h1>
+<?php if(!isLogged()): ?>
+  <h2>Register</h2>
+  <?php if(!empty($error)) echo '<p style="color:red;">'.htmlspecialchars($error).'</p>'; ?>
+  <form method="post"><input name="username" placeholder="username" required><br><input name="password" type="password" required><br><button name="register">Register</button></form>
+  <h2>Login</h2>
+  <form method="post"><input name="username" placeholder="username"><br><input name="password" type="password"><br><button name="login">Login</button></form>
+<?php else: $user = currentUser($pdo); ?>
+  <p>Welcome, <?php e($user['username']); ?> — <a href="index.php?action=orders">My Orders</a> — <a href="index.php?action=logout">Logout</a></p>
+  <h3>Place Order</h3>
+  <?php
+    $svs = $pdo->query('SELECT * FROM services')->fetchAll();
+  ?>
+  <form method="post">
+    <select name="service_id">
+      <?php foreach($svs as $s){ echo '<option value="'.(int)$s['id'].'">'.htmlspecialchars($s['name']).' — $'.number_format($s['price_per_unit'],4).'/unit</option>'; } ?>
+    </select><br>
+    <input name="link" placeholder="Post URL / Username" required><br>
+    <input name="quantity" type="number" value="100" required><br>
+    <button name="order">Place Order</button>
+  </form>
+
+  <?php if($_GET['action'] ?? '' == 'orders'): 
+     $orders = $pdo->prepare('SELECT o.*, s.name FROM orders o JOIN services s ON s.id=o.service_id WHERE o.user_id=? ORDER BY o.created_at DESC');
+     $orders->execute([$_SESSION['user_id']]); $ords = $orders->fetchAll();
+  ?>
+     <h3>Your Orders</h3>
+     <table border="1"><tr><th>ID</th><th>Service</th><th>Qty</th><th>Price</th><th>Status</th></tr>
+     <?php foreach($ords as $o){ echo '<tr><td>'.e($o['id']).'</td><td>'.e($o['name']).'</td><td>'.e($o['quantity']).'</td><td>'.e($o['price']).'</td><td>'.e($o['status']).'</td></tr>'; } ?>
+     </table>
+  <?php endif; ?>
+<?php endif; ?>
+
+<?php if(isset($_GET['action']) && $_GET['action']=='logout'){ session_destroy(); header('Location: index.php'); exit; } ?>
+
+<hr>
+<p><a href="admin.php">Admin Panel</a></p>
+</body></html>
+```
+
+---
+
+### FILE: admin.php
+
+```php
+<?php
+// Very small admin panel — protect with ADMIN_PASS
+require_once 'config.php';
+$pdo = getPDO();
+session_start();
+if($_POST['admin_pass'] ?? ''){
+    if($_POST['admin_pass'] === ADMIN_PASS) $_SESSION['is_admin']=true; else $err='Bad pass';
+}
+if(empty($_SESSION['is_admin'])){
+    echo '<form method="post"><input type="password" name="admin_pass" placeholder="Admin pass"><button>Login</button></form>';
+    if(!empty($err)) echo '<p style="color:red;">'.htmlspecialchars($err).'</p>';
+    exit;
+}
+
+// simple management actions
+if($_SERVER['REQUEST_METHOD']=='POST'){
+    if(isset($_POST['add_service'])){
+        $stmt = $pdo->prepare('INSERT INTO services (code,name,price_per_unit,supplier_service_id) VALUES (?,?,?,?)');
+        $stmt->execute([$_POST['code'], $_POST['name'], $_POST['price'], $_POST['supplier_id']]);
+    }
+}
+
+$services = $pdo->query('SELECT * FROM services')->fetchAll();
+$orders = $pdo->query('SELECT o.*, u.username, s.name as service_name FROM orders o JOIN users u ON u.id=o.user_id JOIN services s ON s.id=o.service_id ORDER BY o.created_at DESC')->fetchAll();
+
+?><html><body>
+<h1>Admin</h1>
+<h2>Services</h2>
+<form method="post">
+  Code: <input name="code"> Name: <input name="name"> Price/unit: <input name="price"> Supplier Service ID: <input name="supplier_id"> <button name="add_service">Add</button>
+</form>
+<table border="1"><tr><th>ID</th><th>Code</th><th>Name</th><th>Price</th><th>Supplier ID</th></tr>
+<?php foreach($services as $s) echo '<tr><td>'.e($s['id']).'</td><td>'.e($s['code']).'</td><td>'.e($s['name']).'</td><td>'.e($s['price_per_unit']).'</td><td>'.e($s['supplier_service_id']).'</td></tr>'; ?>
+</table>
+
+<h2>Orders</h2>
+<table border="1"><tr><th>ID</th><th>User</th><th>Service</th><th>Qty</th><th>Price</th><th>Status</th><th>Supplier ID</th></tr>
+<?php foreach($orders as $o) echo '<tr><td>'.e($o['id']).'</td><td>'.e($o['username']).'</td><td>'.e($o['service_name']).'</td><td>'.e($o['quantity']).'</td><td>'.e($o['price']).'</td><td>'.e($o['status']).'</td><td>'.e($o['supplier_order_id']).'</td></tr>'; ?>
+</table>
+
+<p><a href="index.php">Back to site</a></p>
+</body></html>
+```
